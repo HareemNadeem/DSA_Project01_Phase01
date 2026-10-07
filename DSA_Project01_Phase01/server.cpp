@@ -316,10 +316,45 @@ int32_t tokenizeLine(const string &line, Token tokens[], int32_t maxTokens)
     // instruction set = [func, func_end, call, set, add, sub, mul and div]
     // next word is identifier like name of a function, variable name
     // after identifier all are the params/arg, space separated
+    int32_t count = 0;
+    int i = 0;
+    int len = line.length();
+
+    while (i < len && count < maxTokens)
+    {
+        while (i < len && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r')) {
+            i++;
+        }
+
+        if (i >= len) break; 
+                string word = "";
+        while (i < len && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') {
+            word += line[i];
+            i++;
+        }
+                tokens[count].text = word;
+
+        if (count == 0) {
+            tokens[count].type = KEYWORD;
+        }
+        else if (count == 1) {
+            tokens[count].type = IDENTIFIER;
+        }
+        else {
+            tokens[count].type = PARAM;
+        }
+
+        count++;
+    }
+
+    return count;
 }
 Snapshot *buildSnapshot(Stack<Frame> &callStack)
 {
     // build the snapshot based on the callStack given
+    Snapshot* ss = new Snapshot;
+    ss->stackDepth = callStack.snapshot_into(ss->callStack, MAX_STACK_DEPTH);
+    return ss;
 }
 void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline)
 {
