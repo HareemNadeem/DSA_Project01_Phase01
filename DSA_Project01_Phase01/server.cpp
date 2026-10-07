@@ -12,7 +12,6 @@
 #include <string>
 #include <cstdint>
 #include <fstream>
-#include <cstdint>
 #include <cstdio>
 using namespace std;
 
@@ -35,39 +34,74 @@ class Stack
     struct Node
     {
         T data;
-        Node *next;
+        Node* next;
     };
-    Node *top;
+    Node* top;
     int32_t count;
 
 public:
     // Implement these functions:
     Stack()
     { // initialize the stack
+        top = nullptr;
+        count = 0;
     }
-    void push(const T &val)
+    void push(const T& val)
     {
 
         // pushes the value on the stack if max limit is not reached yet.
+        if (count >= MAX_STACK_DEPTH)
+            return;
+        Node* num = new Node;
+        num->data = val;
+        num->next = top;
+        top = num;
+        count++;
     }
     T pop()
     {
         // pop the top value on the stack
+        if (top == nullptr)
+            return T();
+        Node* temp = top;
+        T val = temp->data;
+        top = top->next;
+        delete temp;
+        count--;
+        return val;
     }
-    T &peek()
+    T& peek()
     {
         // returns the top value on the stack
+        return top->data;
     }
     bool isEmpty()
     {
+        return count == 0;
     }
     int32_t depth()
     {
+        return count;
     }
     int32_t snapshot_into(T out[], int32_t maxLen)
     {
         // copies every frame, top to bottom in the array given as a parameter
         // this is what buildSnapshot() call, returns count written
+        int32_t copi = 0;
+        Node* curr = top;
+        while (curr != nullptr && copi < maxLen)
+        {
+            out[copi] = curr->data;
+            copi++;
+            curr = curr->next;
+        }
+        return copi;
+    }
+    //////destructor was missing so i made it to avoid mwmory leak~
+    ~Stack() {
+        if (!isEmpty()) {
+            pop();
+        }
     }
 };
 
@@ -87,20 +121,35 @@ class Timeline
 
 public:
     // Implement these functions
-    Timeline()
-    {
+    Timeline(){
+       head = nullptr;
+        tail = nullptr;
+       stepCount = 0;
     }
-    void record(Snapshot *s)
-    {
-        // add record in the timeline
+    ~Timeline();
+    void record(Snapshot *s){
+         // add record in the timeline
+        TimelineNode* num = new TimelineNode;
+        num->data = s;
+        num->next = nullptr;
+        num->prev = tail;
+        if (tail != nullptr) {
+            tail->next = num;
+        }
+        else {
+                        head = num;
+        }
+        tail = num;
+        stepCount++;
     }
-    TimelineNode *begin()
-    {
+
+    TimelineNode* begin(){
+        return head;
     }
-    int32_t getStepCount()
-    {
+    int32_t getStepCount() {
+        return stepCount;
     }
-};
+  };
 
 // Core structs
 struct Variable
@@ -122,6 +171,18 @@ struct Snapshot
     Frame callStack[MAX_STACK_DEPTH];
     int32_t stackDepth;
 };
+/////////////////////
+Timeline::~Timeline(){
+    TimelineNode* curr = head;
+    while (curr != nullptr)
+    {
+        TimelineNode* neww = curr->next;
+        delete curr->data;
+        delete curr;
+        curr = neww;
+    }
+}
+////////////////////////
 struct TTDBHeader
 {
     char magic[4]; // "TTDB"
@@ -129,11 +190,11 @@ struct TTDBHeader
     int32_t stepCount;
     int64_t indexOffset;
 };
-void writeHeader(FILE *f, const TTDBHeader &h)
-{
+void writeHeader(FILE *f, const TTDBHeader &h){
     fwrite(h.magic, 1, 4, f);
     fwrite(&h.version, sizeof(int32_t), 1, f);
-
+    fwrite(&h.stepCount, sizeof(int32_t), 1, f);
+    fwrite(&h.indexOffset, sizeof(int64_t), 1, f);
     // placeholder for other two data members
 }
 
@@ -148,8 +209,6 @@ struct PendingPatch
     int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
     string targetFuncName;
 };
-
-
 
 // PASS 0x0: READING source.bin + VALIDITY CHECK
 bool readSourceLine(ifstream &in, string &out)
