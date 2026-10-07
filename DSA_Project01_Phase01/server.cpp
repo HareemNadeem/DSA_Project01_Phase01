@@ -209,19 +209,63 @@ struct PendingPatch
     int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
     string targetFuncName;
 };
-
+///helper func
+bool isSpace(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
 // PASS 0x0: READING source.bin + VALIDITY CHECK
 bool readSourceLine(ifstream &in, string &out)
 {
     // reads the next nonblank line
-}
+// 1. Read non-blank line
+         string line;
+        while (getline(in, line)) {
+            int start = 0;
+            int len = (int)line.length();
+       while (start < len && isSpace(line[start])) {
+                start++;
+            }
+
+            int end = len;
+            while (end > start && isSpace(line[end - 1])) {
+                end--;
+            }
+
+            if (start < end) {
+                out = line.substr(start, end - start);
+                return true;
+            }
+        }
+        return false;
+    }
 string firstWord(const string &line)
 {
     // returns first word from the input string
+    string word = "";
+    for (int i = 0; i < line.length(); i++) {
+        if (line[i] == ' ' || line[i] == '\t') {
+            break;
+        }
+        word += line[i];
+    }
+    return word;
 }
 string secondWord(const string &line)
 {
-    // returns the second word
+    int i = 0;
+        while (i < line.length() && line[i] != ' ' && line[i] != '\t') {
+        i++;
+    }
+    while (i < line.length() && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    string word = "";
+    while (i < line.length() && line[i] != ' ' && line[i] != '\t') {
+        word += line[i];
+        i++;
+    }
+    return word;
 }
 bool validateProgram(const char *sourcePath)
 {
