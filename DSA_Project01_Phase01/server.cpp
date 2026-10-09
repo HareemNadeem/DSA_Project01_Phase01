@@ -529,14 +529,125 @@ Snapshot *buildSnapshot(Stack<Frame> &callStack)
     ss->stackDepth = callStack.snapshot_into(ss->callStack, MAX_STACK_DEPTH);
     return ss;
 }
+/////////////////////////////////////////
+///helper functions for this
+/////////////////////////////////////////
+//find variable
+Variable* findVar(Frame& fr, const string& name)
+{
+    for (int32_t i = 0; i < fr.argc; i++)
+    {
+        if (fr.argv[i].name == name)
+            return &fr.argv[i];
+    }
+    for (int32_t i = 0; i < fr.localCount; i++)
+    {
+        if (fr.locals[i].name == name)
+            return &fr.locals[i];
+    }
+    return NULL;
+}
+bool execSet(Frame& cur, Token tokens[], int32_t n, const string& text)
+{
+    if (n < 3)
+    {
+        cerr << "erroir " << text << endl;
+        return false;
+    }
+    int32_t val = value_of_Operand(cur, tokens[2].text);
+    Variable* v=Create(cur, tokens[1].text);
+    if (!v)
+    {
+        cerr << "RUNTIME ERROR: too many variables in " << cur.func_name << endl;
+        return false;
+    }
+    v->value = val;
+    return true;
+}
+int32_t value_of_Operand(Frame& fr, const string& operand)
+{
+    if (isNumber(operand))
+        return toInt(operand);
+    Variable* v = findVar(fr, operand);
+    if (v != NULL)
+        return v->value;
+    return 0;
+}
+Frame makeFrame(const string& name)
+{
+    Frame f;
+    f.func_name = name;
+    f.argc = 0;
+    f.returnLine = -1;
+    f.localCount = 0;
+    return f;
+}
+Variable* Create(Frame& fr, const string& name)
+{
+    Variable* v = findVar(fr, name);
+    if (v != NULL)
+        return v;
+    if (fr.localCount >= MAX_VARS_PER_FRAME)
+        return NULL;
+
+    fr.locals[fr.localCount].name = name;
+    fr.locals[fr.localCount].value = 0;
+    fr.localCount++;
+    return &fr.locals[fr.localCount - 1];
+}
+bool math(Frame& cur, Token tokens[], int32_t n, const string& k, const string& text)
+{
+    if (n < 3)
+    {
+        cerr << " ERROR: '" << k<< "' needs 2 operands: " << text << endl;
+        return false;
+    }
+    Variable* dst = Create(cur, tokens[1].text);
+    if (!dst)
+    {
+        cerr << "error " << cur.func_name << endl;
+        return false;
+    }
+
+    int32_t rhs = value_of_Operand(cur, tokens[2].text);
+
+    if (k== "add")
+        dst->value = dst->value + rhs;
+    else if (k == "sub")
+        dst->value = dst->value - rhs;
+    else if (k == "mul")
+        dst->value = dst->value * rhs;
+    else if (k== "div")
+    {
+        if (rhs == 0)
+        {
+            cerr << "RUNTIME ERROR: division by zero: " << text << endl;
+            return false;
+        }
+        dst->value = dst->value / rhs;
+    }
+    return true;
+}
 void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline)
 {
+    FILE* f = fopen(resolveBinPath, "rb");
+    if (!f)
+    {
+        cerr << "ERROR: cannot open " << resolveBinPath << endl;
+        return;
+    }
     // initialize the call stack
     // make the main frame
     // push main frame on the call stack
 
     // implementation:
     // execute line by line, and according to the keyword perform action
+   
+
+    // callerArgNames[d][i] = jis variable ka naam CALLER ne i-th argument me diya tha,
+    // jo depth d par baithe frame ke liye hai. Return par isi se wapas value likhte hain
+    // ("add b a" ka result main ke k me dikhna chahiye).
+
 }
 
 // PASS 0x3: SERIALIZE TIMELINE
