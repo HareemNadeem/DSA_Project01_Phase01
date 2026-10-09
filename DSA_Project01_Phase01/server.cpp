@@ -6,7 +6,6 @@
 //   2. Pass 0X1   -- resolve(): copy EVERY source line into resolve.bin as [offset][size][string], then patch CALL targets.
 //   3. Pass 0X2   -- execute resolve.bin: tokenize ONE line at a time, update the call stack, take a snapshot -> Timeline
 //   4. Pass 0X3   -- serialize Timeline -> session.tdbg(header + snapshot records + dense index)
-
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
 #include <string>
@@ -14,7 +13,6 @@
 #include <fstream>
 #include <cstdio>
 using namespace std;
-
 // ---- Constants ----
 const int32_t MAX_VARS_PER_FRAME = 16;
 const int32_t MAX_STACK_DEPTH = 64;
@@ -198,6 +196,39 @@ void writeHeader(FILE *f, const TTDBHeader &h){
     // placeholder for other two data members
 }
 
+//helping func for this part
+void wrt_String(FILE* f, const string& s)
+{
+    int32_t length = (int32_t)s.size();///fixed size LIKLE 4 bytes for length of string
+    fwrite(&length, sizeof(int32_t), 1, f);
+    if (length > 0)
+        fwrite(s.c_str(), 1, length, f);
+}
+//////// contains writestring one 
+void wrt_Variable(FILE* f, const Variable& var)
+{
+    wrt_String(f, var.name);
+    fwrite(&var.value, sizeof(int32_t), 1, f);
+}
+///////////contains writevariable one and writevariable 
+void wrt_Frame(FILE* f, const Frame& fr)
+{
+    wrt_String(f, fr.func_name);
+    fwrite(&fr.argc, sizeof(int32_t), 1, f);
+    for (int32_t i = 0; i < fr.argc; i++)
+        wrt_Variable(f, fr.argv[i]);
+    fwrite(&fr.returnLine, sizeof(int32_t), 1, f);
+    fwrite(&fr.localCount, sizeof(int32_t), 1, f);
+    for (int32_t i = 0; i < fr.localCount; i++)
+        wrt_Variable(f, fr.locals[i]);
+}
+////////// contains frame 
+void wrt_Snapshot(FILE* f, const Snapshot& ss)
+{
+    fwrite(&ss.stackDepth, sizeof(int32_t), 1, f);
+    for (int32_t i = 0; i < ss.stackDepth; i++)
+        wrt_Frame(f, ss.callStack[i]);
+}
 // resolve.bin - bookkeeping
 struct FuncEntry
 {
@@ -267,9 +298,38 @@ string secondWord(const string &line)
     }
     return word;
 }
+string Lower(const string& s)
+{
+    string r = s;
+    for (size_t i = 0; i < r.size(); i++)
+    {
+        if (r[i] >= 'A' && r[i] <= 'Z')
+            r[i] = (char)(r[i] - 'A' + 'a');
+    }
+    return r;
+}
 bool validateProgram(const char *sourcePath)
 {
     // for each func defined there should be exactly one func_end and no nested funcs allowed - 
+    ifstream in(sourcePath, ios::binary);
+    if (!in) return false;
+        bool inside = false;
+    string line;
+        while (readSourceLine(in, line))
+    {
+        string word = Lower(firstWord(line));
+
+        if (word == "func") {
+            if (inside) return false; // Dobara func aa gaya (Nested error)
+            inside = true;
+        }
+        else if (word == "func_end") {
+            if (!inside) return false; // Bina func ke end aa gaya
+            inside = false;
+        }
+    }
+
+    return !inside;
 }
 
 // PASS 0x1: RESOLVE() -> resolve.bin
@@ -377,11 +437,58 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 // PASS 0x3: SERIALIZE TIMELINE
 void writeTdbg(Timeline &timeline, const char *tdbgPath)
 {
+    FILE* f = fopen(tdbgPath, "wb+");
+    if (!f)
+    {
+        cerr << "ERROR" << tdbgPath << endl;
+        return;
+    }
     // placeholder for header
+    TTDBHeader ttd;
+    const char magicStr[] = "TTDB";
+    for (int i = 0; i < 4; i++) {
+        ttd.magic[i] = magicStr[i];
+    }
+    ttd.version = 1;
+    ttd.stepCount = 0;
+    ttd.indexOffset = 0;
+    writeHeader(f, ttd);
     // index array of the size of stepcount from the timeline
+    
+    int32_t steps = timeline.getStepCount();
+    int32_t indexSize;
+    if (steps > 0) {
+        indexSize = steps;
+    }
+    else {
+        indexSize = 1;
+    }
+        int64_t* index = new int64_t[indexSize];
     // placing each snapshot in the file while maintaining the index(starting point of each nth snapshot)
+        int32_t i = 0;
+        for (TimelineNode* node = timeline.begin(); node != NULL; node = node->next)
+        {
+            int64_t currentPos = (int64_t)ftell(f);
+            index[i] = currentPos;
+                        
+            i = i + 1;
+                        if (node->data != NULL)
+            {
+                wrt_Snapshot(f, *node->data);
+            }
+        }
     // after timeline add the index array i the file
+        int64_t indexOffset = (int64_t)ftell(f);
+        if (steps > 0)
+            fwrite(index, sizeof(int64_t), steps, f);
     // update the header
+        ttd.stepCount = steps;
+        ttd.indexOffset = indexOffset;
+        fseek(f, 0, SEEK_SET);
+        writeHeader(f, ttd);
+
+        fclose(f);
+        delete[] index;
 }
 // main section
 int32_t main()
