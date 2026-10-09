@@ -102,8 +102,6 @@ public:
         }
     }
 };
-
-
 // Timeline : doubly linked list of Snapshots
 struct Snapshot; // fwd declaration;
 struct TimelineNode
@@ -148,7 +146,16 @@ public:
         return stepCount;
     }
   };
-
+Timeline::~Timeline() {
+    TimelineNode* curr = head;
+    while (curr != nullptr)
+    {
+        TimelineNode* neww = curr->next;
+        delete curr->data;
+        delete curr;
+        curr = neww;
+    }
+}
 // Core structs
 struct Variable
 {
@@ -170,16 +177,7 @@ struct Snapshot
     int32_t stackDepth;
 };
 /////////////////////
-Timeline::~Timeline(){
-    TimelineNode* curr = head;
-    while (curr != nullptr)
-    {
-        TimelineNode* neww = curr->next;
-        delete curr->data;
-        delete curr;
-        curr = neww;
-    }
-}
+
 ////////////////////////
 struct TTDBHeader
 {
@@ -188,14 +186,13 @@ struct TTDBHeader
     int32_t stepCount;
     int64_t indexOffset;
 };
-void writeHeader(FILE *f, const TTDBHeader &h){
-    fwrite(h.magic, 1, 4, f);
-    fwrite(&h.version, sizeof(int32_t), 1, f);
-    fwrite(&h.stepCount, sizeof(int32_t), 1, f);
-    fwrite(&h.indexOffset, sizeof(int64_t), 1, f);
+void writeHeader(FILE *f, const TTDBHeader &ttb){
+    fwrite(ttb.magic, 1, 4, f);
+    fwrite(&ttb.version, sizeof(int32_t), 1, f);
+    fwrite(&ttb.stepCount, sizeof(int32_t), 1, f);
+    fwrite(&ttb.indexOffset, sizeof(int64_t), 1, f);
     // placeholder for other two data members
 }
-
 //helping func for this part
 void wrt_String(FILE* f, const string& s)
 {
@@ -320,11 +317,13 @@ bool validateProgram(const char *sourcePath)
         string word = Lower(firstWord(line));
 
         if (word == "func") {
-            if (inside) return false; // Dobara func aa gaya (Nested error)
+            if (inside) return false;
             inside = true;
         }
         else if (word == "func_end") {
-            if (!inside) return false; // Bina func ke end aa gaya
+            if (!inside) {
+                return false;
+            }
             inside = false;
         }
     }
@@ -349,6 +348,20 @@ int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
 int64_t readResolveRecord(FILE *f, string &outText)
 {
     // reads one record at the current position and advances past it, returns the offset field - the raw line text comes back untouched in outText.
+    int64_t off;
+    int32_t size;
+    if (fread(&off, sizeof(int64_t), 1, f) != 1)
+        return -1;
+    if (fread(&size, sizeof(int32_t), 1, f) != 1)
+        return -1;
+    outText.clear();
+    if (size > 0)
+    {
+        outText.resize(size);
+        if (fread(&outText[0], 1, size, f) != (size_t)size)
+            return -1;
+    }
+    return off;
 }
 int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
 {
@@ -357,15 +370,107 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
     PendingPatch patches[MAX_PATCHES];
     int32_t patchCount = 0;
     // Every source line becomes one record holding the raw line, as-is.
+    ifstream in(sourcePath, ios::binary);
+    if (!in)
+    {
+        cerr << "ERROR" << sourcePath << endl;
+        return -1;
+    }
+       FILE* out = fopen(resolveBinPath, "wb+");
+    if (!out)
+    {
+        cerr << "ERROR" << resolveBinPath << endl;
+        return -1;
+    }
     // resolve() only PEEKS at the leading word(s) -- enough to spot FUNC
+    bool yes= true;
+    string line;
+    while (yes&& readSourceLine(in, line))
+    {
+        string k = Lower(firstWord(line));
+        // Pehle record likho (offset field = apni position), position wapas milti hai
+        int64_t pos = writeResolveRecord(out, (int64_t)ftell(out), line);
+
+        if (k== "func")
+        {
+            string name = secondWord(line);
+            if (funcCount >= MAX_FUNCS)
+            {
+                cerr << "ERROR: too many functions (max " << MAX_FUNCS << ")" << endl;
+                yes= false;
+                break;
+            }
+            for (int32_t i = 0; i < funcCount; i++) // duplicate naam check
+            {
+                if (funcArray[i].funcName == name)
+                {
+                    cerr << "ERROR: function '" << name << "' defined more than once" << endl;
+                    yes= false;
+                    break;
+                }
+            }
+            if (!yes)
+                break;
+            funcArray[funcCount].funcName = name;
+            funcArray[funcCount].byteOffsetInResolveBin = pos;
+            funcCount++;
+        }
+        else if (k== "call")
+        {
+            if (patchCount >= MAX_PATCHES)
+            {
+                cerr << "ERROR "<< MAX_PATCHES << endl;
+                yes= false;
+                break;
+            }
+            patches[patchCount].byteOffsetOfOffsetField = pos; 
+            patches[patchCount].targetFuncName = secondWord(line);
+            patchCount++;
+        }
+    }
     // (remember its position) and CALL (remember which function it needs
     // and where its offset field sits).
+    for (int32_t i = 0; yes&& i < patchCount; i++)
+    {
+        int64_t target = -1;
+        for (int32_t j = 0; j < funcCount; j++)
+        {
+            if (funcArray[j].funcName == patches[i].targetFuncName)
+            {
+                target = funcArray[j].byteOffsetInResolveBin;
+                break;
+            }
+        }
+        if (target < 0)
+        {
+            cerr << "ERROR" << patches[i].targetFuncName << endl;
+            yes=false;
+            break;
+        }
+        fseek(out, (long)patches[i].byteOffsetOfOffsetField, SEEK_SET); 
+        fwrite(&target, sizeof(int64_t), 1, out);                  
+    }
     // Once the whole file is written, every CALL's offset field is patched
     // with its target's position. Patching happens after the full write
     // Returns the byte offset of main's FUNC header record.
-    // if there is no main return the error 
+    int64_t mainOffset=-1;
+    if (yes)
+    {
+        for (int32_t j = 0; j<funcCount; j++)
+        {
+            if (funcArray[j].funcName == "main")
+            {
+                mainOffset = funcArray[j].byteOffsetInResolveBin;
+                break;
+            }
+        }
+        if (mainOffset < 0)
+            cerr << "ERROR" << endl;
+    }
+    fclose(out);
+    return mainOffset;
+ 
 }
-
 // PASS 0x2: EXECUTION (tokenization happens here)
 enum TokenType
 {
