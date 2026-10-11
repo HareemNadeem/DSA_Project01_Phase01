@@ -97,7 +97,7 @@ public:
     }
     //////destructor was missing so i made it to avoid mwmory leak~
     ~Stack() {
-        if (!isEmpty()) {
+        while(!isEmpty()) {
             pop();
         }
     }
@@ -466,6 +466,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
         }
         if (mainOffset < 0)
             cerr << "ERROR" << endl;
+        return 1;
     }
     fclose(out);
     return mainOffset;
@@ -532,7 +533,12 @@ Snapshot *buildSnapshot(Stack<Frame> &callStack)
 /////////////////////////////////////////
 ///helper functions for this
 /////////////////////////////////////////
+bool isNumber(const string& s);
+int32_t toInt(const string& s);
+int32_t value_of_Operand(Frame& fr, const string& operand);
+Variable* Create(Frame& fr, const string& name);
 //find variable
+
 Variable* findVar(Frame& fr, const string& name)
 {
     for (int32_t i = 0; i < fr.argc; i++)
@@ -558,7 +564,7 @@ bool execSet(Frame& cur, Token tokens[], int32_t n, const string& text)
     Variable* v=Create(cur, tokens[1].text);
     if (!v)
     {
-        cerr << "RUNTIME ERROR: too many variables in " << cur.func_name << endl;
+        cerr << " ERROR" << cur.func_name << endl;
         return false;
     }
     v->value = val;
@@ -594,6 +600,41 @@ Variable* Create(Frame& fr, const string& name)
     fr.locals[fr.localCount].value = 0;
     fr.localCount++;
     return &fr.locals[fr.localCount - 1];
+}
+bool isNumber(const string& s)
+{
+    if (s.empty()) 
+        return false;
+    size_t start = 0;
+    if (s[0] == '-')
+    {
+        if (s.length() == 1) 
+            return false;
+        start = 1;
+    }
+    for (size_t i = start; i < s.length(); i++)
+    {
+        if (s[i] < '0' || s[i] > '9')
+            return false;
+    }
+    return true;
+}
+
+int32_t toInt(const string& s)
+{
+    int32_t res = 0;
+    int32_t sign = 1;
+    size_t start = 0;
+    if (!s.empty() && s[0] == '-')
+    {
+        sign=-1;
+        start=1;
+    }
+    for (size_t i = start; i < s.length(); i++)
+    {
+        res=res * 10 + (s[i] - '0');
+    }
+    return res* sign;
 }
 bool math(Frame& cur, Token tokens[], int32_t n, const string& k, const string& text)
 {
@@ -633,21 +674,141 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
     FILE* f = fopen(resolveBinPath, "rb");
     if (!f)
     {
-        cerr << "ERROR: cannot open " << resolveBinPath << endl;
+        cerr << "ERROR " << resolveBinPath << endl;
         return;
     }
     // initialize the call stack
+    static string callerArgNames[MAX_STACK_DEPTH][MAX_VARS_PER_FRAME];
+    Stack<Frame> callStack;
+    Token tokens[MAX_TOKENS];
+    Token calleeTokens[MAX_TOKENS];
+    string text;
     // make the main frame
+     fseek(f, (long)mainOffset, SEEK_SET);
+    readResolveRecord(f, text);                   
+    int64_t pc = (int64_t)ftell(f);              
+    callStack.push(makeFrame("main"));
+        bool running = true;
     // push main frame on the call stack
-
-    // implementation:
+            // implementation:
     // execute line by line, and according to the keyword perform action
-   
+        while (running)
+        {
+            fseek(f, (long)pc, SEEK_SET);
+            int64_t offField = readResolveRecord(f, text); 
+            if (offField < 0)
+            {
+                break; 
+            }
+                        int64_t nextPc = (int64_t)ftell(f);
+            int32_t n = tokenizeLine(text, tokens, MAX_TOKENS);
+                        if (n == 0)
+            {
+                pc = nextPc;
+                continue;
+            }
 
-    // callerArgNames[d][i] = jis variable ka naam CALLER ne i-th argument me diya tha,
-    // jo depth d par baithe frame ke liye hai. Return par isi se wapas value likhte hain
-    // ("add b a" ka result main ke k me dikhna chahiye).
+            string k = Lower(tokens[0].text);
+            if (k.size() >= 2 && k[0] == '/' && k[1] == '/')
+            {
+                pc = nextPc;
+                continue;
+            }
 
+            Frame& cur = callStack.peek();
+           // step
+             // /////////////////////////////////////////////////
+            if (k== "set")
+            {
+                if (!execSet(cur, tokens, n, text))
+                {
+                    break;
+                }
+                pc = nextPc;
+                timeline.record(buildSnapshot(callStack));
+            }
+            // ////////////////////////////////////
+            else if (k== "add" || k== "sub" || k== "mul" || k== "div")
+            {
+                if (!math(cur, tokens, n, k, text))
+                {
+                    break;
+                }
+                pc = nextPc;
+                timeline.record(buildSnapshot(callStack));
+            }
+                 ////////////////////////////////
+            else if (k == "call")
+            {
+                if (callStack.depth() >= MAX_STACK_DEPTH)
+                {
+                    cerr << "RUNTIME ERROR: stack overflow" << endl;
+                    break;
+                }
+               
+                fseek(f, (long)offField, SEEK_SET);
+                string headerText;
+                readResolveRecord(f, headerText);
+                int64_t calleeBodyPc = (int64_t)ftell(f);
+                int32_t hn = tokenizeLine(headerText, calleeTokens, MAX_TOKENS);
+                int32_t paramCount = hn - 2;
+                int32_t argCount = n-2;
+                                if (paramCount != argCount)
+                {
+                    cerr << "ERROR" << endl;
+                    break;
+                }
+                Frame nf = makeFrame(calleeTokens[1].text);
+                nf.argc = paramCount;
+                nf.returnLine = (int32_t)nextPc;
+                int32_t newIndex = callStack.depth();
+          for (int32_t i = 0; i < paramCount; i++)
+                {
+                    nf.argv[i].name = calleeTokens[2 + i].text;
+                    nf.argv[i].value = value_of_Operand(cur, tokens[2 + i].text);
+                    callerArgNames[newIndex][i] = tokens[2 + i].text;
+                }
+
+                callStack.push(nf);
+                pc = calleeBodyPc;
+                timeline.record(buildSnapshot(callStack));
+            }
+            else if (k== "func_end")
+            {
+                if (callStack.depth() == 1)
+                {
+                    timeline.record(buildSnapshot(callStack));
+                    running = false;
+                }
+                else
+                {
+                    Frame done = callStack.pop();
+                    int32_t idx = callStack.depth();
+                    Frame& caller = callStack.peek();
+                    for (int32_t i = 0; i < done.argc; i++)
+                    {
+                        const string& nm = callerArgNames[idx][i];
+                        if (!isNumber(nm))
+                        {
+                            Variable* v = Create(caller, nm);
+                            if (v != NULL)
+                            {
+                                v->value = done.argv[i].value;
+                            }
+                        }
+                    }
+                    pc = done.returnLine;
+                    timeline.record(buildSnapshot(callStack));
+                }
+            }
+            else
+            {
+                cerr << "WARNINg " << text << endl;
+                pc = nextPc;
+            }
+        }
+
+        fclose(f);
 }
 
 // PASS 0x3: SERIALIZE TIMELINE
@@ -709,19 +870,15 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
 // main section
 int32_t main()
 {
-
-    if (!validateProgram("source.bin"))
+        if (!validateProgram("source.bin"))
     {
         // send an error response instead of a .tdbg file
         return 1;
     }
 
     int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
-
-    Timeline timeline;
+        Timeline timeline;
     executeProgram("resolve.bin", mainOffset, timeline);
-
-    writeTdbg(timeline, "session.tdbg");
-
-    return 0;
+        writeTdbg(timeline, "session.tdbg");
+            return 0;
 }
