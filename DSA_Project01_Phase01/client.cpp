@@ -90,23 +90,81 @@ bool recvAll(int sock, char* buf, size_t n)
 {
     // recv() can return fewer bytes than asked for, so keep calling it until exactly n bytes are read.
     // Return false if the connection closes or fails before n bytes arrive.
+    size_t g= 0;
+    while (g< n)
+    {
+        ssize_t r = recv(sock, buf + g, n - g, 0);
+        if (r <= 0)
+        {
+            if (r < 0 && errno == EINTR) 
+                continue;
+            return false;
+        }
+        g+= (size_t)r;
+    }
+    return true;
 }
 bool sendAll(int sock, const char* buf, size_t n)
 {
     // send() can send fewer bytes than asked for, so keep calling it until all n bytes are sent.
     // Use the flag MSG_NOSIGNAL. Return false if the connection fails.
-}
-
+       size_t s = 0;
+        while (s< n)
+        {
+            ssize_t r = send(sock, buf + s, n - s, MSG_NOSIGNAL);
+            if (r <= 0)
+            {
+                if (r < 0 && errno == EINTR) continue;
+                return false;
+            }
+            s+= (size_t)r;
+        }
+        return true;
+    }
 int connectToHost(const char* host, int port)
 {
     // Create a TCP socket and connect it to host:port.
     // Return the socket, or -1 if the connection fails.
+    int s = connectSocket(host, port);
+    if (s >= 0)
+        setSocketTimeout(s, CLIENT_TIMEOUT_SEC);
+    return s;
 }
 bool uploadSource(int sock, const char* sourcePath)
 {
     // have to do checksum and then send
     // When the file is finished, call shutdown(sock, SHUT_WR). This is how the server knows the string is complete.
     // Return false if the file cannot be opened or any send fails.
+    FILE* f = fopen(sourcePath, "rb");
+    if (!f)
+    {
+        shutdown(sock, SHUT_WR);
+        return false;
+    }
+    Crc32 crc;
+    char status = STATUS_OK;
+    crc.update(&status, 1);
+    bool ok = sendAll(sock, &status, 1);
+    char buf[IO_BUFFER_SIZE];
+    while (ok)
+    {
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        if (n == 0)
+            break;
+        crc.update(buf, n);
+        ok = sendAll(sock, buf, n);
+    }
+    if (ferror(f))
+        ok = false;
+    fclose(f);
+    if (ok)
+    {
+        char trailer[CRC_SIZE];
+        putU32(crc.value(), trailer);
+        ok = sendAll(sock, trailer, CRC_SIZE);
+    }
+    shutdown(sock, SHUT_WR);
+    return ok;
 }
 bool receiveResponse(int sock, const char* outTdbgPath, string& outError)
 {
@@ -115,39 +173,159 @@ bool receiveResponse(int sock, const char* outTdbgPath, string& outError)
     // Status 1: collect the payload into outError. Status 0: write the payload to the file.
     // At the end call verify(). If it fails, delete the file, set outError to
     // "checksum mismatch, response corrupted" and return false.
+    outError = "";
+    TrailerChecker chk;
+    char b[IO_BUFFER_SIZE];
+    char out[IO_BUFFER_SIZE];
+    bool gotStatus = false;
+    int status = -1;
+    FILE* f = nullptr;
+    bool lost = false;
+    size_t total = 0;
+    while (true)
+    {
+        ssize_t n = recv(sock, b, sizeof(b), 0);
+        if (n < 0)
+        {
+            if (errno == EINTR) continue;
+            lost = true;
+            break;
+        }
+        if (n == 0)
+            break;
+        total += (size_t)n;
+        size_t k = chk.feed(b, (size_t)n, out);
+        size_t off = 0;
+        if (k > 0 && !gotStatus)
+        {
+            status = (unsigned char)out[0];
+            gotStatus = true;
+            off = 1;
+            if (status == STATUS_OK)
+            {
+                f = fopen(outTdbgPath, "wb");
+                if (!f)
+                {
+                    outError = "cannot write the .tdbg file";
+                    return false;
+                }
+            }
+        }
+        if (k > off)
+        {
+            if (status == STATUS_OK)
+                fwrite(out + off, 1, k - off, f);
+            else
+                outError.append(out + off, k - off);
+        }
+    }
+    if (f) {
+        fclose(f);
+    }
+    if (total == 0)
+    {
+        outError = "no reply from the load balancer (it may have dropped the request)";
+        remove(outTdbgPath);
+        return false;
+    }
+    if (lost)
+    {
+        outError = "connection to the load balancer was lost";
+        remove(outTdbgPath);
+        return false;
+    }
+    if (!gotStatus || !chk.verify())
+    {
+        remove(outTdbgPath);
+        outError = "checksum mismatch, response corrupted";
+        return false;
+    }
+    if (status == STATUS_OK) {
+        return true;
+    }
+    if (status != STATUS_ERROR) {
+        outError = "unknown reply status";
+    }
+    remove(outTdbgPath);
+    return false;
 }
-
 // =============================================================================================
 // PART B: READING THE .tdbg FILE
 // File layout (written by Phase 1):
 //   header | snapshot 0 | snapshot 1 | ... | index (one 8 byte offset per snapshot)
 // The index lets us jump straight to any step without reading the steps before it.
 // =============================================================================================
-
 bool openTdbg(const char* path, TdbgReader& r)
 {
+    r.file = fopen(path, "rb");
+    r.index.clear();
+    if (!r.file) return false;
+    FILE* f = r.file;
+    TTDBHeader& h = r.header;
+    bool ok = fread(h.magic, 1, 4, f) == 4 &&
+        fread(&h.version, sizeof(int32_t), 1, f) == 1 && fread(&h.stepCount, sizeof(int32_t), 1, f) == 1 &&
+        fread(&h.indexOffset, sizeof(int64_t), 1, f) == 1;
+       if (ok)
+        ok = memcmp(h.magic, "TTDB", 4) == 0 && h.version == 1 && h.stepCount > 0;
+    if (ok)
+    {
+        fseek(f, 0, SEEK_END);
+        int64_t size = (int64_t)ftell(f);
+        ok = h.indexOffset >= TTDB_HEADER_SIZE && h.indexOffset + (int64_t)8 * h.stepCount == size;
+    }
+    if (ok)
+    {
+        r.index.resize(h.stepCount);
+        fseek(f, (long)h.indexOffset, SEEK_SET);
+        ok = fread(&r.index[0], sizeof(int64_t), h.stepCount, f) == (size_t)h.stepCount;
+    }
+    if (!ok)
+    {
+        closeTdbg(r);
+        return false;
+    }
+    return true;
 }
+    
 void closeTdbg(TdbgReader& r)
 {
-    // Free r.index and close the file.
+    vector<int64_t>().swap(r.index);
+    if (r.file)
+        fclose(r.file);
+    r.file = nullptr;
 }
 Snapshot* readSnapshotAt(TdbgReader& r, int32_t step)
 {
+    if (!r.file || step < 0 || step >= r.header.stepCount)
+        return nullptr;
+    if (fseek(r.file, (long)r.index[step], SEEK_SET) != 0)
+        return nullptr;
+    Snapshot* s = new Snapshot;
+    bool ok = fread(&s->stackDepth, sizeof(int32_t), 1, r.file) == 1 && s->stackDepth >= 0 && s->stackDepth <= MAX_STACK_DEPTH;
+        if (!ok)
+    {
+        delete s;
+        return nullptr;
+    }
+    return s;
 }
-
 // =============================================================================================
 // PART C: THE SESSION IN MEMORY
 // There is one DebugSession variable, created in main() and passed to every command by reference.
 // =============================================================================================
-
 void initSession(DebugSession& s)
 {
-
+    s.active_flag = 0;
+    s.reader.file = nullptr;
+    s.currentStep = 0;
 }
 void closeSession(DebugSession& s)
 {
     // If active, call closeTdbg(s.reader). Then set active = false.
     // Called when the user types quit and when the input ends.
+    if (s.active_flag)
+        closeTdbg(s.reader);
+    s.active_flag = 0;
 }
 
 // =============================================================================================
