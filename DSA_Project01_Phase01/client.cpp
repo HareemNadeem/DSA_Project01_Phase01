@@ -1,502 +1,389 @@
 // ======================= TIME-TRAVEL DEBUGGER - CLIENT TEMPLATE =======================
 
-// The client never talks to the server directly. It only talks to the load balancer.
-// The load balancer wakes the server up if it is down, so the client does not care.
-// The first "start" may just take a bit longer.
-//
-// The network is used ONLY by "start". After the .tdbg file is downloaded,
-// next / prv / jmp read that file on the local disk. They never contact the load balancer.
-//
-// How the pieces fit together:
-//   main loop -> readCommand -> runCommand
-//   start -> cmdStart()  -> requestDebugFile() (Part A) -> openTdbg() (Part B) -> shows step 1
-//   next, prv, jmp -> moveBy() (Part D) -> readSnapshotAt() (Part B) -> printSnapshot() (Part E)
-
+#define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
+#include <fstream>
 #include <string>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
+#include <sstream>
 #include <cstring>
-#include <unistd.h>
 #include <signal.h>
-#include <vector>
+#include <poll.h>
+#include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "helper.h"
 using namespace std;
-const char* PROGRAM_NAME = "ttdb";
-const char* PROMPT = "ttdb> ";
-const int IO_BUFFER_SIZE = 64 * 1024;     // fixed buffer for streaming files to and from the socket
-const char* TDBG_FILE = "ttdb_last.tdbg"; // where the downloaded .tdbg is saved
-const int MAX_JUMP = 1000000000;          // biggest n accepted by jmp
-string LB_HOST = "127.0.0.0";
-int LB_PORT = 5000;
-// These two must be the same as in Phase 1
-const int MAX_VARS_PER_FRAME = 16;
-const int MAX_STACK_DEPTH = 64;
-// ---- Structs (same as Phase 1, so the file can be read back exactly as it was written) ----
-struct Variable
-{
-    string name;
-    int32_t value;
-};
-struct Frame
-{
-    string func_name;
-    int32_t argc;
-    Variable argv[MAX_VARS_PER_FRAME];
-    int32_t returnLine;
-    Variable locals[MAX_VARS_PER_FRAME];
-    int32_t localCount;
-};
-struct Snapshot
-{
-    Frame callStack[MAX_STACK_DEPTH];
-    int32_t stackDepth;
-};
-struct TTDBHeader
-{
-    char magic[4]; // "TTDB"
-    int32_t version;
-    int32_t stepCount;
-    int64_t indexOffset;
-};
 
-// ---- Structs only the client needs ----
+// ---- Constants & Configurations ----
+const string LB_HOST = "127.0.0.1";
+const int LB_PORT = 5000;
+const char* TDBG_FILE = "session.tdbg";
+
+// ---- Client TdbgReader & DebugSession Structures ----
 struct TdbgReader
 {
-    ssize_t file_index;
+    FILE* file;
     TTDBHeader header;
-    vector<int64_t> index;
+    int64_t* index;
 };
+
 struct DebugSession
 {
-    int active_flag;     // false until a "start" has worked
-    TdbgReader reader;   // the .tdbg file stays open for the whole session
-    int64_t currentStep;
+    TdbgReader reader;
+    int32_t currentStep;
+    bool active;
 };
-bool recvAll(int sock, char* buf, size_t n)
-{
-    // recv() can return fewer bytes than asked for, so keep calling it until exactly n bytes are read.
-    // Return false if the connection closes or fails before n bytes arrive.
-    size_t g= 0;
-    while (g< n)
-    {
-        ssize_t r = recv(sock, buf + g, n - g, 0);
-        if (r <= 0)
-        {
-            if (r < 0 && errno == EINTR) 
-                continue;
-            return false;
-        }
-        g+= (size_t)r;
-    }
-    return true;
-}
-bool sendAll(int sock, const char* buf, size_t n)
-{
-    // send() can send fewer bytes than asked for, so keep calling it until all n bytes are sent.
-    // Use the flag MSG_NOSIGNAL. Return false if the connection fails.
-       size_t s = 0;
-        while (s< n)
-        {
-            ssize_t r = send(sock, buf + s, n - s, MSG_NOSIGNAL);
-            if (r <= 0)
-            {
-                if (r < 0 && errno == EINTR) continue;
-                return false;
-            }
-            s+= (size_t)r;
-        }
-        return true;
-    }
-int connectToHost(const char* host, int port)
-{
-    // Create a TCP socket and connect it to host:port.
-    // Return the socket, or -1 if the connection fails.
-    int s = connectSocket(host, port);
-    if (s >= 0)
-        setSocketTimeout(s, CLIENT_TIMEOUT_SEC);
-    return s;
-}
-bool uploadSource(int sock, const char* sourcePath)
-{
-    // have to do checksum and then send
-    // When the file is finished, call shutdown(sock, SHUT_WR). This is how the server knows the string is complete.
-    // Return false if the file cannot be opened or any send fails.
-    FILE* f = fopen(sourcePath, "rb");
-    if (!f)
-    {
-        shutdown(sock, SHUT_WR);
-        return false;
-    }
-    Crc32 crc;
-    char status = STATUS_OK;
-    crc.update(&status, 1);
-    bool ok = sendAll(sock, &status, 1);
-    char buf[IO_BUFFER_SIZE];
-    while (ok)
-    {
-        size_t n = fread(buf, 1, sizeof(buf), f);
-        if (n == 0)
-            break;
-        crc.update(buf, n);
-        ok = sendAll(sock, buf, n);
-    }
-    if (ferror(f))
-        ok = false;
-    fclose(f);
-    if (ok)
-    {
-        char trailer[CRC_SIZE];
-        putU32(crc.value(), trailer);
-        ok = sendAll(sock, trailer, CRC_SIZE);
-    }
-    shutdown(sock, SHUT_WR);
-    return ok;
-}
-bool receiveResponse(int sock, const char* outTdbgPath, string& outError)
-{
-    // Reply on the wire: [status][payload][CRC-32]. The CRC covers the status byte too.
-    // Feed every received byte (status included) to a TrailerChecker.
-    // Status 1: collect the payload into outError. Status 0: write the payload to the file.
-    // At the end call verify(). If it fails, delete the file, set outError to
-    // "checksum mismatch, response corrupted" and return false.
-    outError = "";
-    TrailerChecker chk;
-    char b[IO_BUFFER_SIZE];
-    char out[IO_BUFFER_SIZE];
-    bool gotStatus = false;
-    int status = -1;
-    FILE* f = nullptr;
-    bool lost = false;
-    size_t total = 0;
-    while (true)
-    {
-        ssize_t n = recv(sock, b, sizeof(b), 0);
-        if (n < 0)
-        {
-            if (errno == EINTR) continue;
-            lost = true;
-            break;
-        }
-        if (n == 0)
-            break;
-        total += (size_t)n;
-        size_t k = chk.feed(b, (size_t)n, out);
-        size_t off = 0;
-        if (k > 0 && !gotStatus)
-        {
-            status = (unsigned char)out[0];
-            gotStatus = true;
-            off = 1;
-            if (status == STATUS_OK)
-            {
-                f = fopen(outTdbgPath, "wb");
-                if (!f)
-                {
-                    outError = "cannot write the .tdbg file";
-                    return false;
-                }
-            }
-        }
-        if (k > off)
-        {
-            if (status == STATUS_OK)
-                fwrite(out + off, 1, k - off, f);
-            else
-                outError.append(out + off, k - off);
-        }
-    }
-    if (f) {
-        fclose(f);
-    }
-    if (total == 0)
-    {
-        outError = "no reply from the load balancer (it may have dropped the request)";
-        remove(outTdbgPath);
-        return false;
-    }
-    if (lost)
-    {
-        outError = "connection to the load balancer was lost";
-        remove(outTdbgPath);
-        return false;
-    }
-    if (!gotStatus || !chk.verify())
-    {
-        remove(outTdbgPath);
-        outError = "checksum mismatch, response corrupted";
-        return false;
-    }
-    if (status == STATUS_OK) {
-        return true;
-    }
-    if (status != STATUS_ERROR) {
-        outError = "unknown reply status";
-    }
-    remove(outTdbgPath);
-    return false;
-}
-// =============================================================================================
-// PART B: READING THE .tdbg FILE
-// File layout (written by Phase 1):
-//   header | snapshot 0 | snapshot 1 | ... | index (one 8 byte offset per snapshot)
-// The index lets us jump straight to any step without reading the steps before it.
-// =============================================================================================
+
+// ---- Helper Declaration Forwarding ----
+void closeTdbg(TdbgReader& r);
+
+// ---- Reading TDBG File Helpers ----
 bool openTdbg(const char* path, TdbgReader& r)
 {
     r.file = fopen(path, "rb");
-    r.index.clear();
     if (!r.file) return false;
-    FILE* f = r.file;
-    TTDBHeader& h = r.header;
-    bool ok = fread(h.magic, 1, 4, f) == 4 &&
-        fread(&h.version, sizeof(int32_t), 1, f) == 1 && fread(&h.stepCount, sizeof(int32_t), 1, f) == 1 &&
-        fread(&h.indexOffset, sizeof(int64_t), 1, f) == 1;
-       if (ok)
-        ok = memcmp(h.magic, "TTDB", 4) == 0 && h.version == 1 && h.stepCount > 0;
-    if (ok)
-    {
-        fseek(f, 0, SEEK_END);
-        int64_t size = (int64_t)ftell(f);
-        ok = h.indexOffset >= TTDB_HEADER_SIZE && h.indexOffset + (int64_t)8 * h.stepCount == size;
-    }
-    if (ok)
-    {
-        r.index.resize(h.stepCount);
-        fseek(f, (long)h.indexOffset, SEEK_SET);
-        ok = fread(&r.index[0], sizeof(int64_t), h.stepCount, f) == (size_t)h.stepCount;
-    }
-    if (!ok)
-    {
+
+    if (fread(r.header.magic, 1, 4, r.file) != 4) {
         closeTdbg(r);
         return false;
     }
+    if (fread(&r.header.version, sizeof(int32_t), 1, r.file) != 1 ||
+        fread(&r.header.stepCount, sizeof(int32_t), 1, r.file) != 1 ||
+        fread(&r.header.indexOffset, sizeof(int64_t), 1, r.file) != 1) {
+        closeTdbg(r);
+        return false;
+    }
+
+    if (r.header.stepCount <= 0) {
+        closeTdbg(r);
+        return false;
+    }
+
+    r.index = new int64_t[r.header.stepCount];
+    if (fseek(r.file, (long)r.header.indexOffset, SEEK_SET) != 0) {
+        closeTdbg(r);
+        return false;
+    }
+
+    if (fread(r.index, sizeof(int64_t), r.header.stepCount, r.file) != (size_t)r.header.stepCount) {
+        closeTdbg(r);
+        return false;
+    }
+
     return true;
 }
-    
+
 void closeTdbg(TdbgReader& r)
 {
-    vector<int64_t>().swap(r.index);
-    if (r.file)
+    if (r.file) {
         fclose(r.file);
-    r.file = nullptr;
+        r.file = nullptr;
+    }
+    if (r.index) {
+        delete[] r.index;
+        r.index = nullptr;
+    }
 }
+
+// Deserialization Helpers
+string read_String(FILE* f)
+{
+    int32_t len = 0;
+    if (fread(&len, sizeof(int32_t), 1, f) != 1 || len < 0) return "";
+    if (len == 0) return "";
+    string s(len, '\0');
+    if (fread(&s[0], 1, len, f) != (size_t)len) return "";
+    return s;
+}
+
+void read_Variable(FILE* f, Variable& v)
+{
+    v.name = read_String(f);
+    if (fread(&v.value, sizeof(int32_t), 1, f) != 1) {
+        v.value = 0;
+    }
+}
+
+void read_Frame(FILE* f, Frame& fr)
+{
+    fr.func_name = read_String(f);
+    if (fread(&fr.argc, sizeof(int32_t), 1, f) != 1) fr.argc = 0;
+    for (int32_t i = 0; i < fr.argc && i < MAX_VARS_PER_FRAME; i++) {
+        read_Variable(f, fr.argv[i]);
+    }
+    if (fread(&fr.returnLine, sizeof(int32_t), 1, f) != 1) fr.returnLine = -1;
+    if (fread(&fr.localCount, sizeof(int32_t), 1, f) != 1) fr.localCount = 0;
+    for (int32_t i = 0; i < fr.localCount && i < MAX_VARS_PER_FRAME; i++) {
+        read_Variable(f, fr.locals[i]);
+    }
+}
+
 Snapshot* readSnapshotAt(TdbgReader& r, int32_t step)
 {
-    if (!r.file || step < 0 || step >= r.header.stepCount)
-        return nullptr;
-    if (fseek(r.file, (long)r.index[step], SEEK_SET) != 0)
-        return nullptr;
-    Snapshot* s = new Snapshot;
-    bool ok = fread(&s->stackDepth, sizeof(int32_t), 1, r.file) == 1 && s->stackDepth >= 0 && s->stackDepth <= MAX_STACK_DEPTH;
-        if (!ok)
-    {
+    if (!r.file || step < 0 || step >= r.header.stepCount) return nullptr;
+    if (fseek(r.file, (long)r.index[step], SEEK_SET) != 0) return nullptr;
+
+    Snapshot* s = new Snapshot();
+    bool ok = fread(&s->stackDepth, sizeof(int32_t), 1, r.file) == 1 &&
+        s->stackDepth >= 0 && s->stackDepth <= MAX_STACK_DEPTH;
+    if (!ok) {
         delete s;
         return nullptr;
     }
+
+    for (int32_t i = 0; i < s->stackDepth; i++) {
+        read_Frame(r.file, s->callStack[i]);
+    }
     return s;
 }
-void initSession(DebugSession& s)
-{
-    s.active_flag = 0;
-    s.reader.file = nullptr;
-    s.currentStep = 0;
-}
-void closeSession(DebugSession& s)
-{
-    // If active, call closeTdbg(s.reader). Then set active = false.
-    // Called when the user types quit and when the input ends.
-    if (s.active_flag)
-        closeTdbg(s.reader);
-    s.active_flag = 0;
-}
 
-
-void printSnapshot(int32_t step, int32_t totalSteps, const Snapshot& s);
-
-bool showCurrent(DebugSession& s)
+// ---- Network Helper to request debug file from Load Balancer ----
+bool requestDebugFile(const char* host, int port, const char* sourcePath, const char* outTdbgPath, string& errorOut)
 {
-    // Read the snapshot at s.currentStep, call printSnapshot, delete the snapshot.
-    // If readSnapshotAt returns nullptr, print "damaged .tdbg file" and return false.
-    Snapshot* snap= readSnapshotAt(s.reader, (int32_t)s.currentStep);
-    if (!snap)
-    {
-        cout << "error file" << endl;
+    ifstream src(sourcePath, ios::binary);
+    if (!src) {
+        errorOut = "Cannot open source file: " + string(sourcePath);
         return false;
     }
-    printSnapshot((int32_t)s.currentStep + 1, s.reader.header.stepCount, *snap);
-    delete snap;
-    return true;
-}
-bool moveBy(DebugSession& s, int32_t delta)
-{
-    if (!s.active_flag)
-    {
-        cout << "no session recently used file>" << endl;
+
+    string payload((istreambuf_iterator<char>(src)), istreambuf_iterator<char>());
+    src.close();
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        errorOut = "Failed to create socket.";
         return false;
     }
-    int64_t target = s.currentStep + (int64_t)delta;
-    int64_t total = s.reader.header.stepCount;
-    if (target < 0 || target >= total)
-    {
-        if (delta == 1) {
-            cout << "already at the last step (" << total << ")" << endl;
-        }
-        else if (delta == -1) {
-            cout << "already at the first step" << endl;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, host, &addr.sin_addr);
+
+    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(sock);
+        errorOut = "Failed to connect to Load Balancer.";
+        return false;
+    }
+
+    if (!sendAll(sock, payload.c_str(), payload.length())) {
+        close(sock);
+        errorOut = "Failed to send trace data.";
+        return false;
+    }
+
+    shutdown(sock, SHUT_WR);
+
+    char status = 0;
+    if (recv(sock, &status, 1, 0) <= 0) {
+        close(sock);
+        errorOut = "Server response empty.";
+        return false;
+    }
+
+    if (status != 0) {
+        char errBuf[1024];
+        ssize_t n = recv(sock, errBuf, sizeof(errBuf) - 1, 0);
+        if (n > 0) {
+            errBuf[n] = '\0';
+            errorOut = string(errBuf);
         }
         else {
-            cout << " valid steps are 1.." << total << endl;
+            errorOut = "Server returned error status.";
         }
+        close(sock);
         return false;
     }
-    int64_t old = s.currentStep;
-    s.currentStep = target;
-    if (!showCurrent(s))
-    {
-        s.currentStep = old;
+
+    FILE* outF = fopen(outTdbgPath, "wb");
+    if (!outF) {
+        close(sock);
+        errorOut = "Cannot open output file to write .tdbg.";
         return false;
+    }
+
+    char buf[64 * 1024];
+    ssize_t nRead;
+    while ((nRead = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        fwrite(buf, 1, nRead, outF);
+    }
+    fclose(outF);
+    close(sock);
+    return true;
+}
+
+// ---- Session Controls ----
+void initSession(DebugSession& s)
+{
+    s.reader.file = nullptr;
+    s.reader.index = nullptr;
+    s.reader.header.stepCount = 0;
+    s.currentStep = 0;
+    s.active = false;
+}
+
+void printSnapshot(const Snapshot* ss, int32_t step, int32_t totalSteps)
+{
+    if (!ss) return;
+    cout << "=== Step " << step << " / " << (totalSteps - 1) << " ===" << endl;
+    cout << "Call Stack (Depth: " << ss->stackDepth << "):" << endl;
+    for (int32_t i = ss->stackDepth - 1; i >= 0; i--) {
+        const Frame& f = ss->callStack[i];
+        cout << "  [" << i << "] " << f.func_name << "(";
+        for (int32_t a = 0; a < f.argc; a++) {
+            cout << f.argv[a].name << "=" << f.argv[a].value;
+            if (a < f.argc - 1) cout << ", ";
+        }
+        cout << ")";
+        if (f.returnLine != -1) cout << " retLine=" << f.returnLine;
+        cout << endl;
+
+        if (f.localCount > 0) {
+            cout << "      Locals: ";
+            for (int32_t l = 0; l < f.localCount; l++) {
+                cout << f.locals[l].name << "=" << f.locals[l].value;
+                if (l < f.localCount - 1) cout << ", ";
+            }
+            cout << endl;
+        }
+    }
+}
+
+bool cmdStart(DebugSession& s, const string& sourcePath)
+{
+    if (s.active) {
+        closeTdbg(s.reader);
+        s.active = false;
+    }
+
+    string err;
+    if (!requestDebugFile(LB_HOST.c_str(), LB_PORT, sourcePath.c_str(), TDBG_FILE, err)) {
+        cout << "Error starting debug session: " << err << endl;
+        return false;
+    }
+
+    TdbgReader fr;
+    fr.file = nullptr;
+    fr.index = nullptr;
+    if (!openTdbg(TDBG_FILE, fr)) {
+        cout << "Error reading generated .tdbg file." << endl;
+        return false;
+    }
+
+    s.reader = fr;
+    s.currentStep = 0;
+    s.active = true;
+
+    Snapshot* ss = readSnapshotAt(s.reader, s.currentStep);
+    printSnapshot(ss, s.currentStep, s.reader.header.stepCount);
+    delete ss;
+    return true;
+}
+
+bool cmdNext(DebugSession& s)
+{
+    if (!s.active) {
+        cout << "No active debug session. Use 'start <trace_file>' first." << endl;
+        return false;
+    }
+    if (s.currentStep + 1 >= s.reader.header.stepCount) {
+        cout << "Already at the end of execution timeline." << endl;
+        return false;
+    }
+    s.currentStep++;
+    Snapshot* ss = readSnapshotAt(s.reader, s.currentStep);
+    printSnapshot(ss, s.currentStep, s.reader.header.stepCount);
+    delete ss;
+    return true;
+}
+
+bool cmdPrv(DebugSession& s)
+{
+    if (!s.active) {
+        cout << "No active debug session. Use 'start <trace_file>' first." << endl;
+        return false;
+    }
+    if (s.currentStep <= 0) {
+        cout << "Already at the beginning of execution timeline." << endl;
+        return false;
+    }
+    s.currentStep--;
+    Snapshot* ss = readSnapshotAt(s.reader, s.currentStep);
+    printSnapshot(ss, s.currentStep, s.reader.header.stepCount);
+    delete ss;
+    return true;
+}
+
+bool cmdJmpNext(DebugSession& s)
+{
+    if (!s.active) return false;
+    return cmdNext(s);
+}
+
+bool cmdJmpPrv(DebugSession& s)
+{
+    if (!s.active) return false;
+    return cmdPrv(s);
+}
+
+// ---- Command Processing Loop ----
+bool runCommand(DebugSession& s, const string& line, bool& quit)
+{
+    istringstream iss(line);
+    string cmd;
+    iss >> cmd;
+
+    if (cmd == "quit" || cmd == "exit") {
+        quit = true;
+        return true;
+    }
+    else if (cmd == "start") {
+        string traceFile;
+        iss >> traceFile;
+        if (traceFile.empty()) {
+            cout << "Usage: start <trace_file>" << endl;
+            return false;
+        }
+        return cmdStart(s, traceFile);
+    }
+    else if (cmd == "step" || cmd == "next") {
+        return cmdNext(s);
+    }
+    else if (cmd == "prev" || cmd == "prv") {
+        return cmdPrv(s);
+    }
+    else if (cmd == "jmpnext") {
+        return cmdJmpNext(s);
+    }
+    else if (cmd == "jmpprv") {
+        return cmdJmpPrv(s);
+    }
+    else if (!cmd.empty()) {
+        cout << "Unknown command: " << cmd << endl;
     }
     return true;
 }
-bool cmdStart(DebugSession& s, const string& sourcePath)
-{
-    // 1. requestDebugFile with host and port, saving to TDBG_FILE.
-    // 2. If it fails, print the error text and return false. Keep the old session as it was.
-    // 3. Open the new file with openTdbg into a NEW local TdbgReader.
-    //    If that fails, print "server sent a damaged .tdbg file", keep the old session, return false.
-    // 4. Only now close the old reader (if s.active), then put the new reader into s,
-    //    set s.currentStep = 0 and s.active = true.
-    // 5. Show step 1 with showCurrent(s).
-    string e;
-    if (!requestDebugFile(LB_HOST.c_str(), LB_PORT, sourcePath.c_str(), TDBG_FILE, e))
-    {
-        cout << e<< endl;
-        return false;
-    }
-    TdbgReader fr;
-    fr.file = nullptr;
-    if (!openTdbg(TDBG_FILE, fr))
-    {
-        cout << "server sent a damaged file" << endl;
-        return false;
-    }
-    if (s.active_flag)
-        closeTdbg(s.reader);
-    s.reader = fr;
-    s.currentStep = 0;
-    s.active_flag = 1;
-    return showCurrent(s);
-}
-bool cmdNext(DebugSession& s) {
-    return moveBy(s, 1);
-}
-bool cmdPrv(DebugSession& s) {
-    return moveBy(s, -1);
-}
-bool cmdJmpNext(DebugSession& s, int32_t n) { 
-    return moveBy(s, n); 
-}
-bool cmdJmpPrv(DebugSession& s, int32_t n) { 
-    return moveBy(s, -n);
-}
-void printSnapshot(int32_t step, int32_t totalSteps, const Snapshot& s)
-{
-    cout << "Step " << step << totalSteps << " ===" << endl;
-    cout << "stack:" << endl;
-    for (int32_t i = 0; i < s.stackDepth; i++)
-    {
-        const Frame& fr = s.callStack[i];
-        cout  << i << " " << fr.func_name << endl;
-    }
-}
-void printHelp()
-{
-    // Print the commands
-    cout << "Commands:" << endl;
-    cout << "  start <source file>      send the program to the server and show step 1" << endl;
-    cout << "  next          go one step forward" << endl;
-    cout << "  prv            go one step back" << endl;
-    cout << "  jmp next <n>        go n steps forward" << endl;
-    cout << "  jmp prv <n>        go n steps back" << endl;
-    cout << "  help            show this text" << endl;
-    cout << "  quit | exit      leave" << endl;
-}
-bool runCommand(DebugSession& s, const string& line, bool& quitRequested)
-{
-    // 1. Split the line into words.
-    // 2. If the first word is "ttdb", drop it.
-    // 3. Match the first word:
-    //      start      -> needs a path after it, then cmdStart
-    //      next       -> no more words, then cmdNext
-    //      prv        -> no more words, then cmdPrv
-    //      jmp        -> second word "next" or "prv", third word a positive number ,
-    //                    then cmdJmpNext or cmdJmpPrv
-    //      help       -> printHelp
-    //      quit, exit -> set quitRequested = true
-    // 4. For anything else, or a wrong number of words, print "unknown command" and the help text, and return false.
-    vector<string> w;
-    istringstream iss(line);
-    string word;
-    while (iss >> word) w.push_back(word);
-    if (!w.empty() && w[0] == PROGRAM_NAME) w.erase(w.begin());
-    if (w.empty()) return true;
 
-    const string& cmd = w[0];
-    if (cmd == "start" && w.size() == 2) {
-        return cmdStart(s, w[1]);
-    }
-    if (cmd == "next" && w.size() == 1) {
-        return cmdNext(s);
-    }
-    if (cmd == "prv" && w.size() == 1) {
-        return cmdPrv(s);
-    }
-    if (cmd == "help" && w.size() == 1) { 
-        printHelp();
-        return true; 
-    }
-    if ((cmd == "quit" || cmd == "exit") && w.size() == 1) { 
-        quitRequested = true; 
-        return true;
-    }
-        cout << "unknown command" << endl;
-    printHelp();
-    return false;
-}
-int main(int argc, char* argv[])
+int main()
 {
-    // you get string LB_HOST and int LB_PORT = 0 in arguments of this main function. 
-
-    // DebugSession session; initSession(session);
-    // Print a short welcome and the help text.
-    //
-    // Infinite loop:
-    //   if quitRequested, break
-    //
-    // After the loop: closeSession(session) and return 0.
-    // Never exit the loop because of an error. Only quit or the end of the input leaves it.
-    if (argc >= 2) {
-        LB_HOST = argv[1];
-    }
-    if (argc >= 3) {
-        LB_PORT = atoi(argv[2]);
-    }
-        DebugSession session;
+    DebugSession session;
     initSession(session);
-    cout << "Time-Travel Debugger client load balancer :: " << LB_HOST << ":" << LB_PORT << endl;
-    printHelp();
-        bool quitRequested = false;
-    string line;
-    while (!quitRequested)
-    {
-        cout << PROMPT << flush;
-        if (!getline(cin, line)) break;
-        runCommand(session, line, quitRequested);
-    }
-    closeSession(session);
-    return 0;
 
+    cout << "Time-Travel Debugger Client Ready." << endl;
+    cout << "Commands: start <file>, step, prev, jmpnext, jmpprv, quit" << endl;
+
+    string line;
+    bool quit = false;
+    while (!quit) {
+        cout << "ttdb> ";
+        if (!getline(cin, line)) break;
+        runCommand(session, line, quit);
+    }
+
+    if (session.active) {
+        closeTdbg(session.reader);
+    }
+    cout << "Client exited." << endl;
+    return 0;
 }
