@@ -24,8 +24,6 @@
 #include <sys/socket.h>
 #include "helper.h"
 using namespace std;
-
-// ---- Constants ----
 const char* PROGRAM_NAME = "ttdb";
 const char* PROMPT = "ttdb> ";
 const int IO_BUFFER_SIZE = 64 * 1024;     // fixed buffer for streaming files to and from the socket
@@ -33,13 +31,9 @@ const char* TDBG_FILE = "ttdb_last.tdbg"; // where the downloaded .tdbg is saved
 const int MAX_JUMP = 1000000000;          // biggest n accepted by jmp
 string LB_HOST = "127.0.0.0";
 int LB_PORT = 5000;
-
 // These two must be the same as in Phase 1
-
 const int MAX_VARS_PER_FRAME = 16;
 const int MAX_STACK_DEPTH = 64;
-
-
 // ---- Structs (same as Phase 1, so the file can be read back exactly as it was written) ----
 struct Variable
 {
@@ -81,11 +75,6 @@ struct DebugSession
     TdbgReader reader;   // the .tdbg file stays open for the whole session
     int64_t currentStep;
 };
-
-// =============================================================================================
-// PART A: TALKING TO THE LOAD BALANCER
-// =============================================================================================
-
 bool recvAll(int sock, char* buf, size_t n)
 {
     // recv() can return fewer bytes than asked for, so keep calling it until exactly n bytes are read.
@@ -309,10 +298,6 @@ Snapshot* readSnapshotAt(TdbgReader& r, int32_t step)
     }
     return s;
 }
-// =============================================================================================
-// PART C: THE SESSION IN MEMORY
-// There is one DebugSession variable, created in main() and passed to every command by reference.
-// =============================================================================================
 void initSession(DebugSession& s)
 {
     s.active_flag = 0;
@@ -328,11 +313,8 @@ void closeSession(DebugSession& s)
     s.active_flag = 0;
 }
 
-// =============================================================================================
-// PART D: THE COMMANDS
-// =============================================================================================
 
-void printSnapshot(int32_t step, int32_t totalSteps, const Snapshot& s); // defined in Part E
+void printSnapshot(int32_t step, int32_t totalSteps, const Snapshot& s);
 
 bool showCurrent(DebugSession& s)
 {
@@ -420,12 +402,6 @@ bool cmdJmpNext(DebugSession& s, int32_t n) {
 bool cmdJmpPrv(DebugSession& s, int32_t n) { 
     return moveBy(s, -n);
 }
-
-
-// =============================================================================================
-// PART E: PRINTING
-// =============================================================================================
-
 void printSnapshot(int32_t step, int32_t totalSteps, const Snapshot& s)
 {
     cout << "Step " << step << totalSteps << " ===" << endl;
@@ -448,11 +424,6 @@ void printHelp()
     cout << "  help            show this text" << endl;
     cout << "  quit | exit      leave" << endl;
 }
-
-// =============================================================================================
-// PART F: THE INFINITE LOOP
-// =============================================================================================
-
 bool runCommand(DebugSession& s, const string& line, bool& quitRequested)
 {
     // 1. Split the line into words.
@@ -491,8 +462,7 @@ bool runCommand(DebugSession& s, const string& line, bool& quitRequested)
         quitRequested = true; 
         return true;
     }
-
-    cout << "unknown command" << endl;
+        cout << "unknown command" << endl;
     printHelp();
     return false;
 }
@@ -508,15 +478,17 @@ int main(int argc, char* argv[])
     //
     // After the loop: closeSession(session) and return 0.
     // Never exit the loop because of an error. Only quit or the end of the input leaves it.
-    if (argc >= 2) LB_HOST = argv[1];
-    if (argc >= 3) LB_PORT = atoi(argv[2]);
-
-    DebugSession session;
+    if (argc >= 2) {
+        LB_HOST = argv[1];
+    }
+    if (argc >= 3) {
+        LB_PORT = atoi(argv[2]);
+    }
+        DebugSession session;
     initSession(session);
-    cout << "Time-Travel Debugger client, load balancer at " << LB_HOST << ":" << LB_PORT << endl;
+    cout << "Time-Travel Debugger client load balancer :: " << LB_HOST << ":" << LB_PORT << endl;
     printHelp();
-
-    bool quitRequested = false;
+        bool quitRequested = false;
     string line;
     while (!quitRequested)
     {
